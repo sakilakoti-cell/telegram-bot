@@ -1,28 +1,83 @@
-name: telegram-bot
-on:
-  schedule:
-    - cron: "*/10 * * * *"
-  workflow_dispatch:
-permissions:
-  contents: write
-concurrency:
-  group: bot
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install requests
-      - run: python bot.py
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          OWNER_ID: ${{ secrets.OWNER_ID }}
-          CHANNEL: "@amazingbazaar_24hr"
-      - run: |
-          git config user.name "bot"
-          git config user.email "bot@users.noreply.github.com"
-          git add -A
-          git diff --cached --quiet || (git commit -m "update" && git push)
+import os, json, requests
+from datetime import datetime, timezone, timedelta
+
+TOKEN = os.environ["BOT_TOKEN"].strip()
+CHANNEL = os.environ["CHANNEL"].strip()
+OWNER = int(os.environ["OWNER_ID"].strip())
+PER_RUN = 1
+API = f"https://api.telegram.org/bot{TOKEN}"
+BOT_ID = TOKEN.split(":")[0]
+
+now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+mins = now.hour * 60 + now.minute
+ACTIVE = 9 * 60 <= mins <= 23 * 60 + 30
+
+def load(f, d):
+    try:
+        return json.load(open(f, encoding="utf-8"))
+    except Exception:
+        return d
+
+def save(f, o):
+    json.dump(o, open(f, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+
+def send(chat, text, link=None):
+    data = {"chat_id": chat, "text": text, "disable_web_page_preview": False}
+    if link:
+        data["reply_markup"] = json.dumps(
+            {"inline_keyboard": [[{"text": "🛒 Buy Now", "url": link}]]}
+        )
+    r = requests.post(API + "/sendMessage", data=data)
+    print("sendMessage:", r.status_code, r.json().get("description", "ok"))
+    return r.ok
+
+state = load("state.json", {})
+if state.get("bot") != BOT_ID:
+    state = {"offset": 0, "bot": BOT_ID}
+queue = load("queue.json", [])
+
+me = requests.get(API + "/getMe").json()
+print("token ok:", me.get("ok"), me.get("description", ""))
+
+# 1. మీరు బోట్‌కు పంపిన లింక్స్ తీసుకోవడం
+res = requests.get(API + "/getUpdates", params={"offset": state["offset"]}).json()
+print("getUpdates ok:", res.get("ok"), res.get("description", ""), "count:", len(res.get("result", [])))
+added = 0
+for u in res.get("result", []):
+    state["offset"] = u["update_id"] + 1
+    m = u.get("message")
+    if not m or m["from"]["id"] != OWNER:
+        continue
+    for line in m.get("text", "").splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) == 3 and parts[2].startswith("http"):
+            queue.append({"t": parts[0], "p": parts[1], "l": parts[2]})
+            added += 1
+        elif len(parts) == 1 and parts[0].startswith("http"):
+            queue.append({"t": "", "p": "", "l": parts[0]})
+            added += 1
+print("added:", added, "queue:", len(queue), "active:", ACTIVE)
+if added:
+    send(OWNER, f"✅ {added} లింక్స్ యాడ్ అయ్యాయి. క్యూలో మొత్తం: {len(queue)}")
+
+# 2. ఛానల్‌లో పోస్ట్ చేయడం
+before = len(queue)
+for _ in range(PER_RUN if ACTIVE else 0):
+    if not queue:
+        break
+    item = queue.pop(0)
+    title = item["t"] or "Great Deal!"
+    text = f"🔥 {title}"
+    if item["p"]:
+        text += f"\n💰 {item['p']}"
+    if not send(CHANNEL, text, item["l"]):
+        send(OWNER, f"⚠️ ఈ లింక్ పోస్ట్ కాలేదు: {item['l']}")
+
+# 3. క్యూ తక్కువైతే హెచ్చరిక
+for t in (30, 10, 0):
+    if before > t >= len(queue):
+        send(OWNER, f"⚠️ క్యూలో {len(queue)} లింక్స్ మాత్రమే మిగిలాయి. ఇంకా పంపండి.")
+        break
+
+save("state.json", state)
+save("queue.json", queue)
